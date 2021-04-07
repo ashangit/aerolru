@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	aero "github.com/aerospike/aerospike-client-go"
 	"go.uber.org/zap"
 	"strconv"
@@ -74,7 +75,6 @@ func (r *ServeCmd) Run() error {
 
 	// Const info req
 	const sets_req = "sets"
-	const histogram_req = "histogram:namespace=persisted;set=lru;type=ttl"
 
 	for {
 		// GET LIST OF HOSTS
@@ -117,6 +117,8 @@ func (r *ServeCmd) Run() error {
 				const number_of_replica = 2
 				soft_limit := 20_000_000 * number_of_replica / number_of_hosts
 				hard_limit := 25_000_000 * number_of_replica / number_of_hosts
+				histogram_req := fmt.Sprintf("histogram:namespace=%s;set=%s;type=ttl", r.AerospkeNamespace, set_name)
+
 
 				if set_size > hard_limit {
 					sugar.Infof("Compute ttl to remove for %s set because reach max items: %d/%d", set_name, set_size, hard_limit)
