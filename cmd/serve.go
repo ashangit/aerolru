@@ -9,7 +9,7 @@ import (
 )
 
 type ServeCmd struct {
-	AerospkeHostname  string `default:"48-df-37-7e-51-20.storage.criteo.preprod" help:"available aerospike node from the target cluster"`
+	AerospkeHostname  string `default:"server" help:"available aerospike node from the target cluster"`
 	AerospkePort      int    `default:"3000" help:"aerospike port"`
 	AerospkeNamespace string `default:"persisted" help:"aerospike namespace"`
 	AerospkeSet       string `default:"lru" help:"aerospike set"`
@@ -43,10 +43,6 @@ func createNewConnection(clientPolicy *aero.ClientPolicy, host *aero.Host) (*aer
 
 	return conn, nil
 }
-
-// TODO: discover list of nodes
-// TODO: add protection to not remove more than N% of the items N being (hard - soft)/hard * 100 + 5%
-// TODO: query all nodes?
 
 func (r *ServeCmd) Run() error {
 	logger, _ := zap.NewProduction()
@@ -99,7 +95,6 @@ func (r *ServeCmd) Run() error {
 			rawMetrics, err := aero.RequestInfo(conn, infoKeys...)
 			panicOnError(sugar, err)
 
-			sugar.Infof("sets: %s", rawMetrics[sets_req])
 			// get nb events per sets
 			sets := strings.Split(rawMetrics[sets_req], ";")
 			for _, set := range sets {
@@ -118,17 +113,15 @@ func (r *ServeCmd) Run() error {
 					break
 				}
 
-				// do clean up if limit raise
-				// TODO get it from sum of all nodes
 				// Const
 				const number_of_replica = 2
 				soft_limit := 20_000_000 * number_of_replica / number_of_hosts
 				hard_limit := 25_000_000 * number_of_replica / number_of_hosts
 
-				set_ttl[set_name] = 0
-
 				if set_size > hard_limit {
-					sugar.Infof("Reduce size of %s set because reach max items: %d/%d", set_name, set_size, hard_limit)
+					sugar.Infof("Compute ttl to remove for %s set because reach max items: %d/%d", set_name, set_size, hard_limit)
+
+					set_ttl[set_name] = 0
 
 					var infoKeys = []string{histogram_req}
 
@@ -139,12 +132,11 @@ func (r *ServeCmd) Run() error {
 
 					histogram_metrics := strings.Split(rawMetrics[histogram_req], ":")
 
-					units := strings.Split(histogram_metrics[0], "=")[1]
-					println(units)
+					//units := strings.Split(histogram_metrics[0], "=")[1]
 					bucket_width, _ := strconv.Atoi(strings.Split(histogram_metrics[2], "=")[1])
 
 					// get buckets
-					// TODO ensure we do not remove all items
+					// TODO: add protection to not remove more than N% of the items N being (hard - soft)/hard * 100 + 5%
 					var total_nb_items_removed = 0
 					for k, v := range strings.Split(strings.Split(histogram_metrics[3], "=")[1], ",") {
 						nb_items, _ := strconv.Atoi(v)
@@ -176,9 +168,9 @@ func (r *ServeCmd) Run() error {
 			}
 		}
 
-		//Sleep before to check again size
+		// Sleep before to check again size
 		duration_sleep := 20 * time.Minute
-		sugar.Infof("Sleep %d before to restart check set size", duration_sleep)
+		sugar.Infof("Sleep %f min before to restart check set size", duration_sleep.Minutes())
 		time.Sleep(duration_sleep)
 	}
 	return nil
