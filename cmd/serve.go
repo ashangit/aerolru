@@ -2,7 +2,6 @@ package cmd
 
 import (
 	aero "github.com/aerospike/aerospike-client-go"
-	asl "github.com/aerospike/aerospike-client-go/logger"
 	"go.uber.org/zap"
 	"strconv"
 	"strings"
@@ -16,14 +15,38 @@ type ServeCmd struct {
 	AerospkeSet       string `default:"lru" help:"aerospike set"`
 }
 
-func panicOnError(err error) {
+func panicOnError(sugar *zap.SugaredLogger, err error) {
 	if err != nil {
+		sugar.Error(err)
 		panic(err)
 	}
 }
 
+func createNewConnection(clientPolicy *aero.ClientPolicy, host *aero.Host) (*aero.Connection, error) {
+	conn, err := aero.NewConnection(clientPolicy, host)
+	if err != nil {
+		return nil, err
+	}
+
+	if clientPolicy.RequiresAuthentication() {
+		if err := conn.Login(clientPolicy); err != nil {
+			return nil, err
+		}
+	}
+
+	// Set no connection deadline to re-use connection, but socketTimeout will be in effect
+	var deadline time.Time
+	err = conn.SetTimeout(deadline, clientPolicy.Timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
 // TODO: discover list of nodes
-// query all nodes
+// TODO: add protection to not remove more than N% of the items N being (hard - soft)/hard * 100 + 5%
+// TODO: query all nodes?
 
 func (r *ServeCmd) Run() error {
 	logger, _ := zap.NewProduction()
@@ -31,134 +54,132 @@ func (r *ServeCmd) Run() error {
 	sugar := logger.Sugar()
 	sugar.Info("Start aero lru")
 
-	asl.Logger.SetLevel(asl.DEBUG)
-	clientPolicy := aero.NewClientPolicy()
+	//asl.Logger.SetLevel(asl.DEBUG)
 
-	// allow only ONE connection
-	clientPolicy.ConnectionQueueSize = 1
-	clientPolicy.Timeout = time.Duration(300) * time.Second
+	// CREATE CLIENT
 	client, err := aero.NewClientWithPolicy(nil, r.AerospkeHostname, r.AerospkePort)
 	if err != nil {
 		sugar.Errorf("Failed to connect to %s:%s due to %s", r.AerospkeHostname, r.AerospkePort, err)
 		return err
 	}
-	task, err := client.RegisterUDFFromFile(nil, "udf/lru.lua", "lru.lua", aero.LUA)
-	if err != nil {
-		panicOnError(err)
-	}
-	for err := range task.OnComplete() {
-		if err != nil {
-			panicOnError(err)
-		}
-	}
 
-	host := aero.NewHost(r.AerospkeHostname, int(r.AerospkePort))
-
-	createNewConnection := func() (*aero.Connection, error) {
-		conn, err := aero.NewConnection(clientPolicy, host)
-		if err != nil {
-			return nil, err
-		}
-
-		if clientPolicy.RequiresAuthentication() {
-			if err := conn.Login(clientPolicy); err != nil {
-				return nil, err
-			}
-		}
-
-		// Set no connection deadline to re-use connection, but socketTimeout will be in effect
-		var deadline time.Time
-		err = conn.SetTimeout(deadline, clientPolicy.Timeout)
-		if err != nil {
-			return nil, err
-		}
-
-		return conn, nil
+	// REGISTER UDF
+	sugar.Info("Register LRU UDF")
+	taskRegister, err := client.RegisterUDFFromFile(nil, "udf/lru.lua", "lru.lua", aero.LUA)
+	panicOnError(sugar, err)
+	for err := range taskRegister.OnComplete() {
+		panicOnError(sugar, err)
 	}
 
-	// Info request
+	// allow only ONE connection
+	clientPolicy := aero.NewClientPolicy()
+	clientPolicy.ConnectionQueueSize = 1
+	clientPolicy.Timeout = time.Duration(300) * time.Second
+
+	// Const info req
 	const sets_req = "sets"
+	const histogram_req = "histogram:namespace=persisted;set=lru;type=ttl"
 
-	var infoKeys = []string{sets_req}
+	for {
+		// GET LIST OF HOSTS
+		nodes := client.GetNodes()
+		number_of_hosts := len(nodes)
 
-	conn, err := createNewConnection()
-	rawMetrics, err := aero.RequestInfo(conn, infoKeys...)
-	if err != nil {
-		sugar.Error(err)
-		panicOnError(err)
-	}
+		var set_ttl map[string]int
+		set_ttl = make(map[string]int)
 
-	sugar.Infof("sets: %s", rawMetrics[sets_req])
+		// Scan for too empty nodes/sets
+		for _, node := range nodes {
+			host := node.GetHost()
+			sugar.Infof("Check node %s", host.Name)
 
-	// get nb events
-	sets := strings.Split(rawMetrics[sets_req], ";")
-	for _, set := range sets {
-		set_metrics := strings.Split(set, ":")
-		var object_number = 0
-		for _, set_metric := range set_metrics {
-			//println(set_metric)
-			if strings.Contains(set_metric, "objects=") {
-				object_number, _ = strconv.Atoi(strings.Split(set_metric, "=")[1])
-				break
-			}
-		}
+			var infoKeys = []string{sets_req}
 
-		// do clean up if limit raise
-		// TODO get it from sum of all nodes
-		if object_number > 10000 {
-			sugar.Info("Reduce size of lru set because reach max items")
-
-			const histogram_req = "histogram:namespace=persisted;set=lru;type=ttl"
-
-			var infoKeys = []string{histogram_req}
-
-			conn, err := createNewConnection()
+			conn, err := createNewConnection(clientPolicy, host)
 			rawMetrics, err := aero.RequestInfo(conn, infoKeys...)
-			if err != nil {
-				sugar.Error(err)
-				panicOnError(err)
-			}
-			sugar.Infof("histogram: %s", rawMetrics[histogram_req])
-			histogram_metrics := strings.Split(rawMetrics[histogram_req], ":")
-			units := strings.Split(histogram_metrics[0], "=")[1]
-			println(units)
-			bucket_width, _ := strconv.Atoi(strings.Split(histogram_metrics[2], "=")[1])
-			for _, histogram_metric := range histogram_metrics {
-				// get buckets
-				if strings.Contains(histogram_metric, "buckets=") {
-					var ttl_to_remove_from = 0
-					//println(histogram_metric)
-					for k, v := range strings.Split(histogram_metric, ",") {
-						println(k)
+			panicOnError(sugar, err)
+
+			sugar.Infof("sets: %s", rawMetrics[sets_req])
+			// get nb events per sets
+			sets := strings.Split(rawMetrics[sets_req], ";")
+			for _, set := range sets {
+				set_metrics := strings.Split(set, ":")
+
+				if len(set_metrics) < 8 {
+					sugar.Debugf("Not enough metrics return for set on %s: %s", host.Name, set_metrics)
+					break
+				}
+
+				set_name := strings.Split(set_metrics[1], "=")[1]
+				set_size, _ := strconv.Atoi(strings.Split(set_metrics[2], "=")[1])
+
+				// Do not check non lru set
+				if set_name != "lru" {
+					break
+				}
+
+				// do clean up if limit raise
+				// TODO get it from sum of all nodes
+				// Const
+				const number_of_replica = 2
+				soft_limit := 20_000_000 * number_of_replica / number_of_hosts
+				hard_limit := 25_000_000 * number_of_replica / number_of_hosts
+
+				set_ttl[set_name] = 0
+
+				if set_size > hard_limit {
+					sugar.Infof("Reduce size of %s set because reach max items: %d/%d", set_name, set_size, hard_limit)
+
+					var infoKeys = []string{histogram_req}
+
+					rawMetrics, err := aero.RequestInfo(conn, infoKeys...)
+					panicOnError(sugar, err)
+
+					sugar.Infof("histogram: %s", rawMetrics[histogram_req])
+
+					histogram_metrics := strings.Split(rawMetrics[histogram_req], ":")
+
+					units := strings.Split(histogram_metrics[0], "=")[1]
+					println(units)
+					bucket_width, _ := strconv.Atoi(strings.Split(histogram_metrics[2], "=")[1])
+
+					// get buckets
+					// TODO ensure we do not remove all items
+					var total_nb_items_removed = 0
+					for k, v := range strings.Split(strings.Split(histogram_metrics[3], "=")[1], ",") {
 						nb_items, _ := strconv.Atoi(v)
 						if nb_items > 0 {
-							println(k)
-							println(nb_items)
-							ttl_to_remove_from = (k + 1) * bucket_width
-							println((k + 1) * bucket_width)
-							break
+							total_nb_items_removed += nb_items
+							if set_size-total_nb_items_removed < soft_limit {
+								ttl_to_remove_from_node := (k + 1) * bucket_width
+								if ttl_to_remove_from_node > set_ttl[set_name] {
+									set_ttl[set_name] = ttl_to_remove_from_node
+								}
+								break
+							}
 						}
 					}
-					// select ttl to remove
-					println(ttl_to_remove_from)
-
-					// call udf
-					qpolicy := aero.NewQueryPolicy()
-					stmt := aero.NewStatement(r.AerospkeNamespace, r.AerospkeSet)
-					task, err := client.ExecuteUDF(qpolicy, stmt, "lru", "remove_old_object", aero.NewValue(ttl_to_remove_from))
-					if err != nil {
-						panicOnError(err)
-					}
-					for err := range task.OnComplete() {
-						if err != nil {
-							panicOnError(err)
-						}
-					}
-					break
 				}
 			}
 
 		}
+
+		//// call udf for each set
+		for set_name, ttl := range set_ttl {
+			sugar.Infof("Remove item with ttl less than %d on set %s", ttl, set_name)
+			qpolicy := aero.NewQueryPolicy()
+			stmt := aero.NewStatement(r.AerospkeNamespace, set_name)
+			taskExecute, err := client.ExecuteUDF(qpolicy, stmt, "lru", "remove_old_object", aero.NewValue(ttl))
+			panicOnError(sugar, err)
+			for err := range taskExecute.OnComplete() {
+				panicOnError(sugar, err)
+			}
+		}
+
+		//Sleep before to check again size
+		duration_sleep := 20 * time.Minute
+		sugar.Infof("Sleep %d before to restart check set size", duration_sleep)
+		time.Sleep(duration_sleep)
 	}
 	return nil
 }
